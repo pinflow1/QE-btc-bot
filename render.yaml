@@ -1,0 +1,9 @@
+services:
+  - type: worker
+    name: qe-btc-bot
+    runtime: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: python btc_bot.py
+    envVars:
+      - key: BOT_TOKEN
+        value: 8901119327:AAHf19GS27It-ssOBTReXk3sS_JH1dC4s60
