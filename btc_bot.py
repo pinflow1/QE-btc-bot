@@ -229,9 +229,19 @@ def main():
     app.add_handler(CommandHandler("alerts", list_alerts))
     app.add_handler(CommandHandler("removealert", remove_alert))
 
+    # Ensure the main thread has an active event loop before PTB's run_polling
+    # (older PTB versions call the now-removed implicit-loop-creation behavior,
+    # which Python 3.14+ no longer supports).
+    import asyncio as _asyncio
+    try:
+        _asyncio.get_event_loop()
+    except RuntimeError:
+        _asyncio.set_event_loop(_asyncio.new_event_loop())
+
     logger.info("Bot starting (polling)...")
     app.run_polling(drop_pending_updates=True)
 
 
 if __name__ == "__main__":
     main()
+                                    
