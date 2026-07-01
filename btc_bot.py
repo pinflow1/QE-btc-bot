@@ -20,7 +20,7 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
-CHECK_INTERVAL_SECONDS = int(os.environ.get("CHECK_INTERVAL_SECONDS", "60"))
+CHECK_INTERVAL_SECONDS = int(os.environ.get("CHECK_INTERVAL_SECONDS", "90"))
 DATA_FILE = os.environ.get("ALERTS_FILE", "alerts.json")
 PORT = int(os.environ.get("PORT", "10000"))
 
@@ -51,10 +51,46 @@ def save_alerts(alerts: dict) -> None:
 
 # ---------- price fetching ----------
 
+_price_cache = {"value": None, "ts": 0.0}
+_PRICE_CACHE_TTL = 20  # seconds
+
+_HEADERS = {"User-Agent": "btc-price-tracker-bot/1.0"}
+
+
 def get_btc_price() -> float:
-    resp = requests.get(COINGECKO_URL, timeout=10)
-    resp.raise_for_status()
-    return resp.json()["bitcoin"]["usd"]
+    now = time.time()
+    if _price_cache["value"] is not None and (now - _price_cache["ts"]) < _PRICE_CACHE_TTL:
+        return _price_cache["value"]
+
+    last_error = None
+    for attempt in range(3):
+        try:
+            resp = requests.get(COINGECKO_URL, headers=_HEADERS, timeout=10)
+            if resp.status_code == 429:
+                # Rate limited - if we have a (possibly stale) cached value, use it
+                # rather than failing outright.
+                retry_after = float(resp.headers.get("Retry-After", 2 * (attempt + 1)))
+                if _price_cache["value"] is not None:
+                    logger.warning(
+                        "CoinGecko rate limited, serving cached price (%.2f)",
+                        _price_cache["value"],
+                    )
+                    return _price_cache["value"]
+                time.sleep(min(retry_after, 10))
+                continue
+            resp.raise_for_status()
+            price_value = resp.json()["bitcoin"]["usd"]
+            _price_cache["value"] = price_value
+            _price_cache["ts"] = now
+            return price_value
+        except requests.exceptions.RequestException as e:
+            last_error = e
+            time.sleep(1.5 * (attempt + 1))
+
+    if _price_cache["value"] is not None:
+        logger.warning("Price fetch failed, serving stale cached price")
+        return _price_cache["value"]
+    raise last_error or RuntimeError("Failed to fetch BTC price")
 
 
 # ---------- command handlers ----------
@@ -244,4 +280,4 @@ def main():
 
 if __name__ == "__main__":
     main()
-                                    
+            
