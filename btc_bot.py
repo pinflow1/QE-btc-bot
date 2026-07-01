@@ -1,146 +1,237 @@
-import logging
-import asyncio
 import os
+import json
+import logging
+import threading
+import time
+from http.server import BaseHTTPRequestHandler, HTTPServer
+
+import requests
 from telegram import Update
-from telegram.ext import Application, CommandHandler, ContextTypes
-import aiohttp
-
-# ─── CONFIG ─────────────────────────────────────────────
-TOKEN = os.environ.get("BOT_TOKEN", "8901119327:AAHf19GS27It-ssOBTReXk3sS_JH1dC4s60")
-COINGECKO_API = "https://api.coingecko.com/api/v3/simple/price"
-
-# In-memory alert storage: {user_id: [target_price, ...]}
-ALERTS = {}
+from telegram.ext import (
+    ApplicationBuilder,
+    CommandHandler,
+    ContextTypes,
+)
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-    level=logging.INFO
+    level=logging.INFO,
 )
 logger = logging.getLogger(__name__)
 
-# ─── HELPERS ────────────────────────────────────────────
-async def fetch_btc_price() -> float:
-    async with aiohttp.ClientSession() as session:
-        async with session.get(
-            COINGECKO_API,
-            params={"ids": "bitcoin", "vs_currencies": "usd"}
-        ) as resp:
-            if resp.status != 200:
-                raise ConnectionError(f"API returned {resp.status}")
-            data = await resp.json()
-            return float(data["bitcoin"]["usd"])
+BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
+CHECK_INTERVAL_SECONDS = int(os.environ.get("CHECK_INTERVAL_SECONDS", "60"))
+DATA_FILE = os.environ.get("ALERTS_FILE", "alerts.json")
+PORT = int(os.environ.get("PORT", "10000"))
 
-# ─── COMMANDS ───────────────────────────────────────────
+COINGECKO_URL = (
+    "https://api.coingecko.com/api/v3/simple/price"
+    "?ids=bitcoin&vs_currencies=usd"
+)
+
+_lock = threading.Lock()
+
+
+# ---------- persistence ----------
+
+def load_alerts() -> dict:
+    if not os.path.exists(DATA_FILE):
+        return {}
+    try:
+        with open(DATA_FILE, "r") as f:
+            return json.load(f)
+    except (json.JSONDecodeError, OSError):
+        return {}
+
+
+def save_alerts(alerts: dict) -> None:
+    with open(DATA_FILE, "w") as f:
+        json.dump(alerts, f)
+
+
+# ---------- price fetching ----------
+
+def get_btc_price() -> float:
+    resp = requests.get(COINGECKO_URL, timeout=10)
+    resp.raise_for_status()
+    return resp.json()["bitcoin"]["usd"]
+
+
+# ---------- command handlers ----------
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "👋 *BTC Price Tracker*\n\n"
-        "• /price — Get current BTC/USD price\n"
-        "• /alert `<price>` — Set a price alert\n"
-        "• /alerts — List your active alerts\n"
-        "• /removealert `<index>` — Remove an alert\n\n"
-        "_Alerts are checked every 60 seconds._",
-        parse_mode="Markdown"
+    text = (
+        "*BTC Price Tracker Bot*\n\n"
+        "Commands:\n"
+        "/price - Get current BTC/USD price\n"
+        "/alert <price> - Set a price alert\n"
+        "/alerts - List your alerts\n"
+        "/removealert <index> - Remove an alert\n"
     )
+    await update.message.reply_text(text, parse_mode="Markdown")
+
 
 async def price(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
-        p = await fetch_btc_price()
-        await update.message.reply_text(
-            f"💰 *BTC Price*\n`${p:,.2f}` USD",
-            parse_mode="Markdown"
-        )
+        p = get_btc_price()
+        await update.message.reply_text(f"BTC/USD: ${p:,.2f}")
     except Exception as e:
-        logger.error(f"Price fetch failed: {e}")
-        await update.message.reply_text("❌ Couldn't fetch price. Try again in a moment.")
+        logger.exception("price fetch failed")
+        await update.message.reply_text("Couldn't fetch the price right now, try again shortly.")
+
 
 async def alert(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
+    chat_id = str(update.effective_chat.id)
     if not context.args:
-        await update.message.reply_text("Usage: `/alert 75000`", parse_mode="Markdown")
+        await update.message.reply_text("Usage: /alert <price>\nExample: /alert 65000")
         return
-
     try:
         target = float(context.args[0])
-        if target <= 0:
-            raise ValueError
     except ValueError:
-        await update.message.reply_text("❌ Please provide a valid positive number.")
+        await update.message.reply_text("Please provide a valid number, e.g. /alert 65000")
         return
 
-    ALERTS.setdefault(user_id, []).append(target)
-    await update.message.reply_text(
-        f"✅ Alert set for `${target:,.2f}`\nI'll message you when BTC crosses it.",
-        parse_mode="Markdown"
-    )
+    with _lock:
+        alerts = load_alerts()
+        alerts.setdefault(chat_id, [])
+        alerts[chat_id].append(target)
+        save_alerts(alerts)
 
-async def alerts(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    user_alerts = ALERTS.get(user_id, [])
+    await update.message.reply_text(f"Alert set: I'll notify you when BTC hits ${target:,.2f}")
+
+
+async def list_alerts(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = str(update.effective_chat.id)
+    with _lock:
+        alerts = load_alerts()
+    user_alerts = alerts.get(chat_id, [])
     if not user_alerts:
-        await update.message.reply_text("You have no active alerts.")
+        await update.message.reply_text("You have no active alerts. Set one with /alert <price>")
         return
+    lines = [f"{i}. ${v:,.2f}" for i, v in enumerate(user_alerts)]
+    await update.message.reply_text("Your alerts:\n" + "\n".join(lines))
 
-    lines = [f"*{i}.* `${p:,.2f}`" for i, p in enumerate(user_alerts, 1)]
-    await update.message.reply_text(
-        "🚨 *Your Alerts*\n" + "\n".join(lines),
-        parse_mode="Markdown"
-    )
 
-async def removealert(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
+async def remove_alert(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = str(update.effective_chat.id)
     if not context.args:
-        await update.message.reply_text("Usage: `/removealert 1`", parse_mode="Markdown")
+        await update.message.reply_text("Usage: /removealert <index>\nSee indexes with /alerts")
+        return
+    try:
+        idx = int(context.args[0])
+    except ValueError:
+        await update.message.reply_text("Please provide a valid index number.")
         return
 
-    try:
-        idx = int(context.args[0]) - 1
-        user_alerts = ALERTS.get(user_id, [])
-        if 0 <= idx < len(user_alerts):
-            removed = user_alerts.pop(idx)
-            if not user_alerts:
-                del ALERTS[user_id]
-            await update.message.reply_text(f"✅ Removed alert for `${removed:,.2f}`", parse_mode="Markdown")
-        else:
-            await update.message.reply_text("❌ Invalid index. Use /alerts to see your list.")
-    except ValueError:
-        await update.message.reply_text("❌ Please provide a valid index number.")
+    with _lock:
+        alerts = load_alerts()
+        user_alerts = alerts.get(chat_id, [])
+        if idx < 0 or idx >= len(user_alerts):
+            await update.message.reply_text("No alert with that index. See /alerts")
+            return
+        removed = user_alerts.pop(idx)
+        alerts[chat_id] = user_alerts
+        save_alerts(alerts)
 
-# ─── BACKGROUND JOB ─────────────────────────────────────
-async def check_alerts(context: ContextTypes.DEFAULT_TYPE):
-    try:
-        price_now = await fetch_btc_price()
-        logger.info(f"Alert check: BTC @ ${price_now:,.2f}")
+    await update.message.reply_text(f"Removed alert for ${removed:,.2f}")
 
-        for user_id, targets in list(ALERTS.items()):
-            for target in targets[:]:
-                if price_now >= target:
-                    await context.bot.send_message(
-                        chat_id=user_id,
-                        text=f"🚨 *BTC Alert Triggered!*\n"
-                             f"Target: `${target:,.2f}`\n"
-                             f"Current: `${price_now:,.2f}`",
-                        parse_mode="Markdown"
-                    )
-                    ALERTS[user_id].remove(target)
 
-            if not ALERTS[user_id]:
-                del ALERTS[user_id]
-    except Exception as e:
-        logger.error(f"Alert check error: {e}")
+# ---------- background alert checker ----------
 
-# ─── MAIN ───────────────────────────────────────────────
+def alert_checker_loop(bot_token: str):
+    from telegram import Bot
+    import asyncio
+
+    bot = Bot(token=bot_token)
+
+    async def check_once():
+        try:
+            current_price = get_btc_price()
+        except Exception:
+            logger.exception("background price fetch failed")
+            return
+
+        with _lock:
+            alerts = load_alerts()
+            changed = False
+            for chat_id, targets in list(alerts.items()):
+                remaining = []
+                for target in targets:
+                    # Trigger if price crossed the target since we don't track direction,
+                    # notify once then remove it.
+                    if abs(current_price - target) / target <= 0.001 or (
+                        current_price >= target
+                    ):
+                        try:
+                            asyncio.run_coroutine_threadsafe(
+                                bot.send_message(
+                                    chat_id=int(chat_id),
+                                    text=(
+                                        f"🚨 BTC hit your alert price!\n"
+                                        f"Target: ${target:,.2f}\n"
+                                        f"Current: ${current_price:,.2f}"
+                                    ),
+                                ),
+                                loop,
+                            ).result(timeout=15)
+                        except Exception:
+                            logger.exception("failed to send alert message")
+                            remaining.append(target)
+                        changed = True
+                    else:
+                        remaining.append(target)
+                alerts[chat_id] = remaining
+            if changed:
+                save_alerts(alerts)
+
+    loop = asyncio.new_event_loop()
+
+    def run_loop():
+        asyncio.set_event_loop(loop)
+        loop.run_forever()
+
+    t = threading.Thread(target=run_loop, daemon=True)
+    t.start()
+
+    while True:
+        asyncio.run_coroutine_threadsafe(check_once(), loop).result(timeout=30)
+        time.sleep(CHECK_INTERVAL_SECONDS)
+
+
+# ---------- tiny health check server (Render web services need a bound port) ----------
+
+class HealthHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.end_headers()
+        self.wfile.write(b"OK")
+
+    def log_message(self, format, *args):
+        pass  # silence default request logging
+
+
+def run_health_server():
+    server = HTTPServer(("0.0.0.0", PORT), HealthHandler)
+    server.serve_forever()
+
+
 def main():
-    application = Application.builder().token(TOKEN).build()
+    if not BOT_TOKEN:
+        raise RuntimeError("TELEGRAM_BOT_TOKEN environment variable is not set")
 
-    application.add_handler(CommandHandler("start", start))
-    application.add_handler(CommandHandler("price", price))
-    application.add_handler(CommandHandler("alert", alert))
-    application.add_handler(CommandHandler("alerts", alerts))
-    application.add_handler(CommandHandler("removealert", removealert))
+    threading.Thread(target=run_health_server, daemon=True).start()
+    threading.Thread(target=alert_checker_loop, args=(BOT_TOKEN,), daemon=True).start()
 
-    application.job_queue.run_repeating(check_alerts, interval=60, first=10)
+    app = ApplicationBuilder().token(BOT_TOKEN).build()
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("price", price))
+    app.add_handler(CommandHandler("alert", alert))
+    app.add_handler(CommandHandler("alerts", list_alerts))
+    app.add_handler(CommandHandler("removealert", remove_alert))
 
-    application.run_polling()
+    logger.info("Bot starting (polling)...")
+    app.run_polling(drop_pending_updates=True)
+
 
 if __name__ == "__main__":
     main()
